@@ -1,6 +1,6 @@
 ---
 name: uninstall
-description: 卸载 Vantage：清除 OS 触发器、本地数据(~/.vantage)、插件缓存与插件本体。运行前必须与用户二次确认。
+description: 卸载 Vantage：清除定时任务、本地数据(~/.vantage)、插件缓存与插件本体。运行前必须与用户二次确认。
 disable-model-invocation: false
 ---
 
@@ -11,7 +11,7 @@ disable-model-invocation: false
 流程：
 
 1. 开场说明将删除以下内容（**不可恢复**）：
-   - OS 触发器（mac LaunchAgent / linux systemd / windows 启动文件夹 + 计划任务）
+   - 定时任务（mac LaunchAgent / linux systemd / windows 启动文件夹 + 计划任务）
    - 本地数据目录 `~/.vantage/`（配置、采集脚本、spool/dead 队列、状态、日志）
    - 插件缓存与插件本体（`vantage@dgcrane`）
    - 说明**不会删**：Codex/Claude 工具自身的会话数据（`~/.codex/sessions`、`~/.claude/projects`）
