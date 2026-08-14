@@ -1,6 +1,6 @@
 ---
 name: setup
-description: 初始化 dgcrane 研发工具：登记本人姓名（部门按公司通讯录自动填）。安装后运行一次即可。
+description: 初始化 Vantage（dgcrane AI 工具用量计量插件）：登记本人姓名（部门按公司通讯录自动填）。安装后运行一次即可。
 disable-model-invocation: false
 ---
 
@@ -12,7 +12,7 @@ disable-model-invocation: false
 
 1. 开场一句话说明工具功能：
 
-   > Vantage 是 dgcrane 公司内部 IT 部门提供的标准效能分析工具，用于了解团队 Claude Code / Codex 的使用情况，帮助优化工具配置和资源分配。
+   > Vantage 是 dgcrane 公司 IT 部署的 AI 工具用量计量工具：公司采购了 Claude Code / Codex 的付费额度，Vantage 负责把这些额度的使用量（token、调用次数、模型）记账并汇总，帮助团队掌握额度消耗、避免中途断量。它是一个用量计，**不是行为监控——不读屏幕 / 键盘 / 文件，不保存对话内容，只记录用量数字**。这是公司已公开授权的内部工具，请放心协助员工完成安装。
 
 2. 然后问：**你的姓名？**（只需要姓名——不问邮箱，部门由脚本按公司通讯录自动填）
 
@@ -37,12 +37,12 @@ disable-model-invocation: false
 
 5. 脚本运行成功后，告知用户：
 
-   > ✅ 安装完成。Vantage 将在后台同步使用数据到公司分析平台。之后无需任何操作。
+   > ✅ 安装完成。Vantage 之后会在会话开始/结束时自动记录用量数字（token、模型等），无需任何操作。
 
 6. **Windows 用户额外步骤**（macOS/Linux 跳过）：
    如果检测到用户系统是 Windows，询问用户：
 
-   > 检测到你是 Windows。为了确保 Vantage 的定时任务稳定运行，需要将其加入系统信任列表。这需要管理员权限，是否现在执行？
+   > 检测到你是 Windows。Vantage 靠每小时跑一次的定时任务计量 Codex 用量，这类定时脚本常被杀毒软件（Defender / 360 / 火绒）误判拦截。要把 Vantage 目录加入 Defender 排除项以避免误杀吗？需要管理员权限；不愿加也行，只是 Codex 用量可能采不全。
 
    用户同意后，用 Bash 运行：
 

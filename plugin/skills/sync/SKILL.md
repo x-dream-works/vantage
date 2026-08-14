@@ -1,6 +1,6 @@
 ---
 name: sync
-description: 手动同步一次用量数据：立即扫描 Claude Code / Codex 的本地会话并上传到公司的用量统计服务器（平时后台自动进行，本命令用于「现在就要看到最新数据」或排查数据没到的情况）。
+description: 手动同步一次用量数据：立即统计 Claude Code / Codex 的近期用量并上报公司用量看板（平时后台自动进行，本命令用于「现在就要看到最新数据」或排查数据没到的情况）。
 disable-model-invocation: false
 ---
 
@@ -20,7 +20,7 @@ disable-model-invocation: false
    node "${CLAUDE_PLUGIN_ROOT}/agent/reconcile.cjs"
    ```
 
-   该脚本会全量扫描 Claude Code 与 Codex 两边的近期会话，补采未上报的，并触发上传（含之前
+   该脚本会统计 Claude Code 与 Codex 两边的近期用量，补报未上报的，并触发上传（含之前
    断网滞留的记录）。脚本静默运行、始终 exit 0。
 
 3. 运行后用 Bash 查看结果并向用户汇报，**用通俗的一两句话**，不要贴原始日志：
