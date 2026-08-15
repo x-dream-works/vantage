@@ -13,8 +13,9 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const https = require("node:https");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const installers = require("./agent/installers.cjs");
+const { pluginVersion } = require("./agent/core.cjs");
 
 const BASE_DIR = path.join(os.homedir(), ".vantage");
 const AGENT_SRC = path.join(__dirname, "agent");
@@ -32,10 +33,8 @@ const defaults = loadDefaults();
 
 const [name = "", deptArg = ""] = process.argv.slice(2);
 // 优先级：命令行参数 > 环境变量 > 插件内置默认 > 兜底
-const serverUrl =
-  process.argv[4] || process.env.VANTAGE_SERVER || defaults.server_url || "http://localhost:3000";
-const token =
-  process.argv[5] || process.env.VANTAGE_TOKEN || defaults.token || "dev-token-change-me";
+const serverUrl = process.argv[4] || process.env.VANTAGE_SERVER || defaults.server_url || "http://localhost:3000";
+const token = process.argv[5] || process.env.VANTAGE_TOKEN || defaults.token || "dev-token-change-me";
 
 // 公司花名册（由通讯录生成）：姓名 -> 部门。缺文件时退化为纯手填模式。
 function loadRoster() {
@@ -49,16 +48,13 @@ function loadRoster() {
 
 // 编辑距离（花名册重名纠错用；中文名短，距离≤1 即视为疑似笔误）
 function editDistance(a, b) {
-  const m = a.length, n = b.length;
+  const m = a.length,
+    n = b.length;
   const d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
   for (let j = 0; j <= n; j++) d[0][j] = j;
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
-      d[i][j] = Math.min(
-        d[i - 1][j] + 1,
-        d[i][j - 1] + 1,
-        d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-      );
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
   return d[m][n];
 }
 
@@ -134,11 +130,18 @@ function getJson(url, token, timeoutMs = 15000) {
         res.on("data", (c) => (body += c));
         res.on("end", () => {
           if (res.statusCode < 200 || res.statusCode >= 300) return resolve(null);
-          try { resolve(JSON.parse(body)); } catch { resolve(null); }
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            resolve(null);
+          }
         });
-      }
+      },
     );
-    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
     req.on("error", () => resolve(null));
     req.end();
   });
@@ -169,9 +172,12 @@ function postJson(url, token, body, timeoutMs = 15000) {
       (res) => {
         res.resume();
         resolve(res.statusCode || 0);
-      }
+      },
     );
-    req.on("timeout", () => { req.destroy(); resolve(0); });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(0);
+    });
     req.on("error", () => resolve(0));
     req.write(data);
     req.end();
@@ -202,18 +208,22 @@ function writeConfig(department) {
     /* 首次安装 */
   }
   // 当前插件版本:setup 时固化进 config,稳定副本(Codex 触发器)上报安装时可带出
-  let pluginVersion = "";
-  try {
-    pluginVersion = JSON.parse(fs.readFileSync(path.join(__dirname, ".claude-plugin", "plugin.json"), "utf8")).version || "";
-  } catch { /* 无 manifest 不致命 */ }
+  const version = pluginVersion();
   fs.writeFileSync(
     p,
     JSON.stringify(
-      { name, department, server_url: serverUrl, token, installed_at: installedAt, ...(pluginVersion ? { plugin_version: pluginVersion } : {}) },
+      {
+        name,
+        department,
+        server_url: serverUrl,
+        token,
+        installed_at: installedAt,
+        ...(version ? { plugin_version: version } : {}),
+      },
       null,
-      2
+      2,
     ) + "\n",
-    { mode: 0o600 }
+    { mode: 0o600 },
   );
   try {
     fs.chmodSync(p, 0o600);
@@ -246,10 +256,28 @@ function installTrigger() {
     // 成功输出静音（员工只看「登记成功/完成」），失败(!开头)照常打印
     else if (process.platform === "win32") {
       installers.installWindowsCodexTrigger({ log: (m) => String(m).startsWith("!") && console.log(m) });
-    }
-    else console.log(`· 未知平台 ${process.platform}，跳过 Codex 定时扫描（Claude 仍正常）`);
+    } else console.log(`· 未知平台 ${process.platform}，跳过 Codex 定时扫描（Claude 仍正常）`);
   } catch (e) {
     console.log(`！Codex 定时扫描安装失败（Claude 采集不受影响）：${e.message}`);
+  }
+}
+
+// 把 Vantage 自己的两个目录加进 Windows Defender 排除项(白名单),防后台采集脚本被误杀。
+// 只排除 ~/.vantage 与插件目录,不做全局排除;需要管理员权限,失败提示用管理员模式重跑。
+function addDefenderExclusions() {
+  if (process.platform !== "win32") return;
+  if (process.env.VANTAGE_SKIP_TRIGGER === "1") return; // 测试沙箱不碰系统设置
+  const dirs = [BASE_DIR, path.resolve(__dirname, "..")];
+  const ps = "Add-MpPreference " + dirs.map((d) => `-ExclusionPath "${d}"`).join(" ");
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+      stdio: "ignore",
+      timeout: 20000,
+      windowsHide: true,
+    });
+    console.log("成功");
+  } catch {
+    console.log("请用管理员模式打开 cmd 重新运行安装命令");
   }
 }
 
@@ -267,15 +295,13 @@ if (deptArg.includes("@")) {
   const department = await resolveDepartment(name, deptArg);
   writeConfig(department);
   syncAgent();
+  addDefenderExclusions();
   installTrigger();
 
   // 上报 /install(幂等,服务端保留最早安装时间)并领取本期续费卡密:
   // 卡密池空时管理员在后台面板该员工行里补卡,员工重跑本安装命令即可领到。
   const base = String(serverUrl).replace(/\/+$/, "");
-  let setupVer = "";
-  try {
-    setupVer = JSON.parse(fs.readFileSync(path.join(__dirname, ".claude-plugin", "plugin.json"), "utf8")).version || "";
-  } catch { /* 无 manifest 不致命 */ }
+  const setupVer = pluginVersion();
   await postJson(`${base}/install`, token, { name, ...(setupVer ? { version: setupVer } : {}) });
   const card = await getJson(`${base}/card/claim?name=${encodeURIComponent(name)}`, token);
 
@@ -313,9 +339,7 @@ if (deptArg.includes("@")) {
   }
 
   console.log("");
-  console.log("== 完成 ==");
-  console.log(`  身份: ${name} / ${department}`);
-})().catch((e) => {
+  console.lo})().catch((e) => {
   console.error("setup 异常:", e);
   process.exit(1);
 });
