@@ -143,6 +143,7 @@ function parseClaudeTranscript(transcriptPath) {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: inputTokens + outputTokens,
+    processed_tokens: inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
     cache_read_tokens: cacheReadTokens,
     cache_creation_tokens: cacheCreationTokens,
     cache_creation_5m_tokens: cache5mTokens, // 1.25 倍档

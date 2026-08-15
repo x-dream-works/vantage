@@ -379,6 +379,16 @@ function spawnShellHidden(command) {
   }
 }
 
+/** 当前插件版本:读插件目录的 plugin.json(hooks 从插件目录跑)。
+ *  稳定副本(~/.vantage/agent,无 plugin.json)返回空串,由调用方退化到 config 的值。*/
+function pluginVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, "..", ".claude-plugin", "plugin.json"), "utf8")).version || "";
+  } catch {
+    return "";
+  }
+}
+
 module.exports = {
   BASE_DIR,
   CONFIG_PATH,
@@ -389,6 +399,7 @@ module.exports = {
   ensureDirs,
   writeFileAtomic,
   loadConfig,
+  pluginVersion,
   log,
   readState,
   writeState,

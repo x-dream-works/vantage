@@ -142,6 +142,7 @@ function parseCodexRollout(rolloutPath) {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     total_tokens: totalTokens,
+    processed_tokens: totalTokens,
     cache_read_tokens: cacheReadTokens,
     cache_creation_tokens: 0, // Codex 无独立的缓存写入计数
     reasoning_tokens: reasoningTokens,

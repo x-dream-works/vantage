@@ -144,33 +144,38 @@ function getJson(url, token, timeoutMs = 15000) {
   });
 }
 
-// HTTP POST (15s 超时,后台 detached 用,不阻塞主流程)。只发,不等响应。
-function postJsonAsync(url, token, body, timeoutMs = 15000) {
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return;
-  }
-  const data = Buffer.from(JSON.stringify(body), "utf8");
-  const mod = u.protocol === "https:" ? https : http;
-  const req = mod.request(
-    u,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-length": data.length,
-        authorization: `Bearer ${token}`,
+// HTTP POST (15s 超时)。返回 HTTP 状态码（网络/超时返回 0）。不抛。
+function postJson(url, token, body, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch {
+      return resolve(0);
+    }
+    const data = Buffer.from(JSON.stringify(body), "utf8");
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.request(
+      u,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": data.length,
+          authorization: `Bearer ${token}`,
+        },
+        timeout: timeoutMs,
       },
-      timeout: timeoutMs,
-    },
-    (res) => res.resume()
-  );
-  req.on("timeout", () => req.destroy());
-  req.on("error", () => {});
-  req.write(data);
-  req.end();
+      (res) => {
+        res.resume();
+        resolve(res.statusCode || 0);
+      }
+    );
+    req.on("timeout", () => { req.destroy(); resolve(0); });
+    req.on("error", () => resolve(0));
+    req.write(data);
+    req.end();
+  });
 }
 
 // 通过 API 查 name 是否在册 + 部门;失败 → null(由调用方退化本地兜底)。
@@ -196,10 +201,15 @@ function writeConfig(department) {
   } catch {
     /* 首次安装 */
   }
+  // 当前插件版本:setup 时固化进 config,稳定副本(Codex 触发器)上报安装时可带出
+  let pluginVersion = "";
+  try {
+    pluginVersion = JSON.parse(fs.readFileSync(path.join(__dirname, ".claude-plugin", "plugin.json"), "utf8")).version || "";
+  } catch { /* 无 manifest 不致命 */ }
   fs.writeFileSync(
     p,
     JSON.stringify(
-      { name, department, server_url: serverUrl, token, installed_at: installedAt },
+      { name, department, server_url: serverUrl, token, installed_at: installedAt, ...(pluginVersion ? { plugin_version: pluginVersion } : {}) },
       null,
       2
     ) + "\n",
@@ -259,13 +269,31 @@ if (deptArg.includes("@")) {
   syncAgent();
   installTrigger();
 
-  // 后台异步上报 /install(不阻塞 setup 完成,失败仅写日志,后续 reconcile 会补报)。
-  // 故意不 await: 请求已发出,进程立即往下走;响应由 Node 事件循环自然处理。
+  // 上报 /install(幂等,服务端保留最早安装时间)并领取本期续费卡密:
+  // 卡密池空时管理员在后台面板该员工行里补卡,员工重跑本安装命令即可领到。
+  const base = String(serverUrl).replace(/\/+$/, "");
+  let setupVer = "";
   try {
-    const base = String(serverUrl).replace(/\/+$/, "");
-    postJsonAsync(`${base}/install`, token, { name });
-  } catch (e) {
-    console.log(`！安装记录上报失败（不影响后续采集）：${e.message}`);
+    setupVer = JSON.parse(fs.readFileSync(path.join(__dirname, ".claude-plugin", "plugin.json"), "utf8")).version || "";
+  } catch { /* 无 manifest 不致命 */ }
+  await postJson(`${base}/install`, token, { name, ...(setupVer ? { version: setupVer } : {}) });
+  const card = await getJson(`${base}/card/claim?name=${encodeURIComponent(name)}`, token);
+
+  console.log("");
+  console.log("== 完成 ==");
+  console.log(`  身份: ${name} / ${department}`);
+  if (card && card.ok) {
+    if (card.claimed) {
+      console.log("");
+      console.log("== 本期续费卡密（请妥善保存） ==");
+      console.log(`  卡密: ${card.card}`);
+      console.log(`  领取时间: ${card.issued_at}`);
+    } else {
+      console.log(`  本期卡密(未到期): ${card.card}`);
+      console.log(`  下次可领: ${card.next_available_at}`);
+    }
+  } else if (card) {
+    console.log(`· 卡密: ${card.message || card.error || "暂时不可用"}`);
   }
 
   // 写完身份立刻后台跑一次对账（除非显式跳过 setup 期副作用，如测试）：

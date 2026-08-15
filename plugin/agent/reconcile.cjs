@@ -12,7 +12,7 @@ const core = require("./core.cjs");
 const updater = require("./self-update.cjs");
 const { parseClaudeTranscript } = require("./parsers/claude-code.cjs");
 const { parseCodexRollout } = require("./parsers/codex.cjs");
-const { fetchCodexQuota, pickQuota } = require("./quota.cjs");
+const { fetchCodexQuota, pickQuota, quotaFingerprint, shouldPublishQuota } = require("./quota.cjs");
 
 // 只回看最近 N 天的会话，避免首次安装时把全部历史一次性灌上去
 const RECENT_DAYS = Number(process.env.VANTAGE_RECENT_DAYS || 7);
@@ -37,6 +37,7 @@ const SELF_UPDATE_SCHEDULED_INTERVAL_MS =
   Number(process.env.VANTAGE_SELF_UPDATE_SCHEDULED_INTERVAL_H || 24) * 3600 * 1000;
 // quota 缓存保质期：拉取失败/节流跳过时沿用上次成功值，超过此龄则丢弃（不给记录贴太旧的额度）。
 const QUOTA_CACHE_MAX_AGE_MS = Number(process.env.VANTAGE_QUOTA_CACHE_MAX_AGE_H || 24) * 3600 * 1000;
+const QUOTA_PUBLISH_HEARTBEAT_MS = Number(process.env.VANTAGE_QUOTA_PUBLISH_HEARTBEAT_H || 6) * 3600 * 1000;
 // 要扫描的数据源：目录 + 解析器 + 工具名
 const SOURCES = [
   {
@@ -268,6 +269,8 @@ async function main() {
   // 专用扫描与定时任务同节流（30min/5min）；全量 reconcile 单独 30min 节流，避免每次开会话都查额度。
   // 结果贴到当轮所有 Codex 记录；失败→null→记录不带 quota，服务端粘性沿用。
   let codexQuota = null;
+  let fetchedQuota = null;
+  let publishFreshQuota = false;
   const needCodexQuota = args.only === "codex" || sources.some((s) => s.tool === "codex");
   if (needCodexQuota) {
     const qstate = core.readState();
@@ -280,14 +283,19 @@ async function main() {
         ? CODEX_EVENT_THROTTLE_MS
         : CODEX_SCHEDULED_THROTTLE_MS;
     const lastQ = Number(qstate[throttleKey] || 0);
-    let fetched = null;
     if (Date.now() - lastQ >= throttleMs) {
       qstate[throttleKey] = Date.now();
-      fetched = await fetchCodexQuota();
-      if (fetched) {
+      fetchedQuota = await fetchCodexQuota();
+      if (fetchedQuota) {
         // 刷新缓存：供后续失败/节流的轮次兜底，保证每条 codex 记录都带 quota。
-        qstate.__quota_cache__ = { value: fetched, at: Date.now() };
-        core.log(`quota: fetched plan=${fetched.plan_type} used=${fetched.rate_limit?.primary_window?.used_percent ?? "-"}%`);
+        qstate.__quota_cache__ = { value: fetchedQuota, at: Date.now() };
+        publishFreshQuota = shouldPublishQuota(
+          fetchedQuota,
+          qstate.__quota_published_fingerprint__,
+          qstate.__quota_published_at__,
+          QUOTA_PUBLISH_HEARTBEAT_MS
+        );
+        core.log(`quota: fetched plan=${fetchedQuota.plan_type} used=${fetchedQuota.primary?.used_percent ?? fetchedQuota.used_percent ?? "-"}%`);
       } else {
         core.log("quota: fetch failed, falling back to cached");
       }
@@ -296,11 +304,13 @@ async function main() {
       core.log(`quota: throttled, using cached (${isFullScan ? "full" : args.trigger}, last ${Math.round((Date.now() - lastQ) / 60000)}min ago)`);
     }
     // 每条 codex 记录都必须带 quota：本轮新鲜值优先，否则沿用保质期内的缓存。
-    codexQuota = pickQuota(fetched, cachedQuota, QUOTA_CACHE_MAX_AGE_MS);
+    codexQuota = pickQuota(fetchedQuota, cachedQuota, QUOTA_CACHE_MAX_AGE_MS);
   }
 
   let totalFiles = 0;
   let swept = 0;
+  let newestCodexFile = null;
+  let publishedQuotaThisRun = false;
   for (const src of sources) {
     const files = listJsonl(src.dir);
     totalFiles += files.length;
@@ -314,6 +324,9 @@ async function main() {
       const fileCutoff = restamp.has(file) ? recentCutoff : cutoff;
       if (st.mtimeMs < fileCutoff) continue; // 太老，跳过
       if (currentSessionId && file.includes(currentSessionId)) continue; // 跳过当前会话
+      if (src.tool === "codex" && (!newestCodexFile || st.mtimeMs > newestCodexFile.mtimeMs)) {
+        newestCodexFile = { file, mtimeMs: st.mtimeMs };
+      }
       if (!core.hasChanged(file, st.size, st.mtimeMs)) continue; // 没变，已同步过
 
       const parsed = src.parse(file);
@@ -333,9 +346,39 @@ async function main() {
       // 额度只贴 Codex（wham 是 OpenAI 账户额度；Claude Code 不沾）。
       if (parsed.tool === "codex" && codexQuota) record.quota = codexQuota;
       core.writeSpool(record);
+      if (parsed.tool === "codex" && fetchedQuota) publishedQuotaThisRun = true;
       core.markProcessed(file, st.size, st.mtimeMs);
       swept += 1;
     }
+  }
+
+  // 会话文件没变化时，额度仍可能变化。复用最近一条 Codex 会话的 dedupe_key 重传快照，
+  // 服务端 upsert 覆盖该会话，不增加会话数；ended_at 保持原值，不污染今日用量。
+  if (publishFreshQuota && !publishedQuotaThisRun && newestCodexFile) {
+    const parsed = parseCodexRollout(newestCodexFile.file);
+    if (parsed?.session_id) {
+      core.writeSpool({
+        ...parsed,
+        name: cfg.name,
+        email: cfg.email,
+        department: cfg.department,
+        machine: cfg.machine,
+        exit_reason: "quota-refresh",
+        dedupe_key: `${parsed.tool}:${parsed.session_id}`,
+        observed_at: new Date().toISOString(),
+        quota: fetchedQuota,
+      });
+      swept += 1;
+      publishedQuotaThisRun = true;
+      core.log(`quota: refreshed via existing session ${parsed.session_id}`);
+    }
+  }
+
+  if (publishedQuotaThisRun && fetchedQuota) {
+    const state = core.readState();
+    state.__quota_published_fingerprint__ = quotaFingerprint(fetchedQuota);
+    state.__quota_published_at__ = Date.now();
+    core.writeState(state);
   }
 
   core.log(

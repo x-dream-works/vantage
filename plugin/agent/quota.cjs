@@ -123,7 +123,7 @@ function readAuth() {
  * 【主通道】经 codex app-server JSON-RPC 读额度（Codexometer 验证过的路线）。
  * 起短命 `codex app-server --stdio` 子进程：initialize 握手 → account/rateLimits/read → 杀进程。
  * codex 自己管理登录态和 token 刷新，绕开 wham 直连时 auth.json 里 token 过期 401 的问题。
- * 输出映射成 wham shape（rate_limit.primary_window.*），服务端/看板零改动。
+ * 输出映射成统一的 primary/secondary 双窗口结构。
  * 任何失败（无 codex / 超时 / 协议错 / 响应缺字段）resolve null，绝不抛。
  * options.command/args 可注入 mock 进程（测试用）。
  */
@@ -219,7 +219,7 @@ function fetchCodexQuotaViaAppServer(options = {}) {
             finish(null);
             return;
           }
-          core.log(`quota: app-server 命中 plan=${mapped.plan_type} used=${mapped.rate_limit.primary_window.used_percent}%`);
+          core.log(`quota: app-server 命中 plan=${mapped.plan_type} used=${mapped.primary.used_percent}%`);
           finish({ ...mapped, observed_at: new Date().toISOString() });
         }
         // 其余 id / 通知一律跳过
@@ -248,25 +248,63 @@ function fetchCodexQuotaViaAppServer(options = {}) {
 
 /**
  * app-server 响应（rateLimits.primary/secondary.usedPercent + resetsAt，unix 秒）
- * → wham shape（rate_limit.primary_window.used_percent + reset_at unix 秒）。
- * 服务端 merge.js 会把 reset_at*1000 转 ISO。纯函数，便于测试。
+ * → 无 PII 的统一双窗口结构（reset_at 为 ISO）。纯函数，便于测试。
  */
+function resetAtIso(value) {
+  if (!value) return null;
+  const n = Number(value);
+  const d = Number.isFinite(n) ? new Date(n < 1e12 ? n * 1000 : n) : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function quotaWindow(raw, reached, appServerShape = false) {
+  if (!raw || typeof (appServerShape ? raw.usedPercent : raw.used_percent) !== "number") return null;
+  const windowMinutes = appServerShape
+    ? raw.windowDurationMins
+    : raw.limit_window_seconds != null ? Number(raw.limit_window_seconds) / 60 : null;
+  return {
+    used_percent: Number(appServerShape ? raw.usedPercent : raw.used_percent),
+    reset_at: resetAtIso(appServerShape ? raw.resetsAt : raw.reset_at),
+    window_minutes: windowMinutes != null && Number.isFinite(Number(windowMinutes)) ? Number(windowMinutes) : null,
+    limit_reached: !!(raw.limit_reached || reached),
+  };
+}
+
+function canonicalQuota(planType, primary, secondary, source) {
+  if (!primary) return null;
+  return {
+    plan_type: planType || null,
+    used_percent: primary.used_percent,
+    reset_at: primary.reset_at,
+    limit_reached: !!(primary.limit_reached || secondary?.limit_reached),
+    primary,
+    secondary: secondary || null,
+    source,
+  };
+}
+
 function mapAppServerQuota(result) {
   const rl = result && result.rateLimits;
   const primary = rl && rl.primary;
   if (!primary || typeof primary.usedPercent !== "number") return null;
   const reachedType = rl.rateLimitReachedType || "";
-  return {
-    plan_type: rl.planType || null,
-    rate_limit: {
-      primary_window: {
-        used_percent: primary.usedPercent,
-        limit_reached: !!reachedType,
-        reset_at: primary.resetsAt || null,
-      },
-    },
-    source: "app-server",
-  };
+  return canonicalQuota(
+    rl.planType,
+    quotaWindow(primary, reachedType, true),
+    quotaWindow(rl.secondary, reachedType, true),
+    "app-server"
+  );
+}
+
+function mapWhamQuota(result) {
+  const rl = result && result.rate_limit;
+  if (!rl) return null;
+  return canonicalQuota(
+    result.plan_type,
+    quotaWindow(rl.primary_window, false),
+    quotaWindow(rl.secondary_window, false),
+    "wham"
+  );
 }
 
 /**
@@ -284,10 +322,9 @@ async function fetchCodexQuota(options = {}) {
 
 /**
  * 【降级通道】wham/usage 直连。
- * 成功返回 wham/usage 的完整响应 + observed_at；
+ * 成功只返回套餐与双窗口额度字段 + observed_at；
  * 任何失败（无凭证 / 网络 / 非200 / 解析错 / 无 rate_limit）返回 null，绝不抛。
- * 服务端应从 rate_limit.primary_window 解析已用百分比。
- * 注意：完整响应包含 user_id / email，服务端必须在入库前脱敏或丢弃。
+ * 原始响应可能含 user_id / email，映射时直接丢弃，不写缓存、不进 spool。
  * observed_at 为本次测量时刻。
  */
 function fetchCodexQuotaWham() {
@@ -322,7 +359,8 @@ function fetchCodexQuotaWham() {
             resolve(null);
             return;
           }
-          resolve({ ...d, observed_at: new Date().toISOString() });
+          const mapped = mapWhamQuota(d);
+          resolve(mapped ? { ...mapped, observed_at: new Date().toISOString() } : null);
         } catch (e) {
           core.log("quota: wham 解析失败 " + String(e));
           resolve(null);
@@ -435,12 +473,27 @@ function pickQuota(fetched, cached, maxAgeMs, now = Date.now()) {
   return null;
 }
 
+function quotaFingerprint(quota) {
+  if (!quota) return "";
+  const window = (w) => w ? [w.used_percent ?? null, w.reset_at ?? null, w.window_minutes ?? null, !!w.limit_reached] : null;
+  return JSON.stringify([quota.plan_type ?? null, window(quota.primary), window(quota.secondary), !!quota.limit_reached]);
+}
+
+function shouldPublishQuota(quota, lastFingerprint, lastPublishedAt, heartbeatMs, now = Date.now()) {
+  if (!quota) return false;
+  const fingerprint = quotaFingerprint(quota);
+  return fingerprint !== (lastFingerprint || "") || now - Number(lastPublishedAt || 0) >= heartbeatMs;
+}
+
 module.exports = {
   fetchCodexQuota,
   fetchCodexQuotaViaAppServer,
   fetchCodexQuotaWham,
   mapAppServerQuota,
+  mapWhamQuota,
   pickQuota,
+  quotaFingerprint,
+  shouldPublishQuota,
   pickProxyFromEnv,
   parseWinRegistryProxy,
   readProxy,

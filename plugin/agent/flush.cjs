@@ -126,16 +126,20 @@ main()
     // 放在 .then 里而不是 main 内部,确保 spool 为空提前 return 时也能执行。
     const cfg = core.loadConfig();
 
-    // 补报 /install
+    // 补报 /install(首次或版本变化时——把当前插件版本带给服务端,后台能看到每人用的版本)
     try {
       const state = core.readState();
-      if (!state.__install_reported__ && cfg.name) {
+      const ver = core.pluginVersion() || cfg.plugin_version || "";
+      const reported = state.__install_reported__;
+      // 首次上报,或已知版本且与上次上报不同(插件升级后刷新服务端的版本记录)。
+      // ver 为空(稳定副本读不到 plugin.json 且 config 无值)时不再重报,避免每轮空报。
+      if (cfg.name && (reported === undefined || (ver && reported !== ver))) {
         const base = String(cfg.server_url).replace(/\/+$/, "");
-        const status = await core.postJsonUrl(`${base}/install`, cfg.token, { name: cfg.name });
+        const status = await core.postJsonUrl(`${base}/install`, cfg.token, { name: cfg.name, ...(ver ? { version: ver } : {}) });
         if (status >= 200 && status < 300) {
-          state.__install_reported__ = true;
+          state.__install_reported__ = ver;
           core.writeState(state);
-          core.log(`install 补报成功 name=${cfg.name}`);
+          core.log(`install 补报成功 name=${cfg.name} version=${ver || "?"}`);
         } else {
           core.log(`install 补报失败 status=${status}(下轮重试)`);
         }
