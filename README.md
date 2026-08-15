@@ -15,7 +15,7 @@
 打开 **cmd**，执行下面这一条命令（把「张三」换成你的姓名）：
 
 ```bat
-claude plugin marketplace add https://github.com/x-dream-works/vantage.git && claude plugin install vantage@dgcrane && node "%USERPROFILE%\.claude\plugins\marketplaces\dgcrane\plugin\setup.cjs" "张三"
+(claude plugin marketplace update dgcrane 2>nul || claude plugin marketplace add https://github.com/x-dream-works/vantage.git) & claude plugin update vantage@dgcrane 2>nul & claude plugin install vantage@dgcrane 2>nul & node "%USERPROFILE%\.claude\plugins\marketplaces\dgcrane\plugin\setup.cjs" "张三"
 ```
 
 - 部门按姓名自动匹配公司通讯录，无需填写
