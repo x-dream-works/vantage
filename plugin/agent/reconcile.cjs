@@ -1,0 +1,367 @@
+#!/usr/bin/env node
+"use strict";
+// Vantage —— 会话扫描/对账（reconcile）。
+// Claude：由 SessionStart 钩子调用（开新会话时兜底补采）；
+// Codex：由 OS 触发器在登录时/每小时/文件变化时调用（--only codex），增量扫 ~/.codex/sessions 采集（cc-switch 同款思路，免钩子/免信任）。
+// 职责：扫历史会话，把"没采到/断网没传成功"的补上（跳过当前刚开的会话），
+// 顺手清理死信/损坏文件、剪枝 state、触发上传。永远 exit 0、不打印 stdout。
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const core = require("./core.cjs");
+const updater = require("./self-update.cjs");
+const { parseClaudeTranscript } = require("./parsers/claude-code.cjs");
+const { parseCodexRollout } = require("./parsers/codex.cjs");
+const { fetchCodexQuota, pickQuota } = require("./quota.cjs");
+
+// 只回看最近 N 天的会话，避免首次安装时把全部历史一次性灌上去
+const RECENT_DAYS = Number(process.env.VANTAGE_RECENT_DAYS || 7);
+// SessionStart 兜底扫描的节流间隔：重度用户一天开几十个会话，每次都全量扫目录纯属空转。
+// 距上次成功的全量扫描不足 N 分钟就跳过本轮（只影响钩子路径；手动 sync、--only 定时任务、
+// setup 后的首次对账都不带 SessionStart 事件，不受节流）。
+const THROTTLE_MS = Number(process.env.VANTAGE_RECONCILE_INTERVAL_MIN || 30) * 60 * 1000;
+// Codex 账户额度（wham/usage）拉取节流：与 Codex 扫描节流共用（scheduled/event），
+// 不再单独计时，避免"扫了 Codex 却不带 quota"。
+// Codex 定时触发节流：默认 30 分钟
+const CODEX_SCHEDULED_THROTTLE_MS = Number(process.env.VANTAGE_CODEX_SCHEDULED_INTERVAL_MIN || 30) * 60 * 1000;
+// Codex 事件触发节流：默认 5 分钟（仅 macOS WatchPaths 使用）
+const CODEX_EVENT_THROTTLE_MS = Number(process.env.VANTAGE_CODEX_EVENT_INTERVAL_MIN || 5) * 60 * 1000;
+// 死信/损坏文件保留天数
+const RETENTION_DAYS = Number(process.env.VANTAGE_RETENTION_DAYS || 14);
+// 插件自更新节流：SessionStart 时后台跑官方 CLI 检查更新（marketplace update + plugin update），
+// 默认 2h 一次（每次检查只是后台一次 git fetch,成本可忽略;收紧是为让修复当天下达员工)。
+// 版本串未 bump 则官方判定"已是最新"、空跑一次无妨;有新版则落盘、下次会话生效。
+const SELF_UPDATE_INTERVAL_MS = Number(process.env.VANTAGE_SELF_UPDATE_INTERVAL_H || 2) * 3600 * 1000;
+// 用户长时间不打开 Claude 时，由现有计划任务每天静默兜底一次。
+const SELF_UPDATE_SCHEDULED_INTERVAL_MS =
+  Number(process.env.VANTAGE_SELF_UPDATE_SCHEDULED_INTERVAL_H || 24) * 3600 * 1000;
+// quota 缓存保质期：拉取失败/节流跳过时沿用上次成功值，超过此龄则丢弃（不给记录贴太旧的额度）。
+const QUOTA_CACHE_MAX_AGE_MS = Number(process.env.VANTAGE_QUOTA_CACHE_MAX_AGE_H || 24) * 3600 * 1000;
+// 要扫描的数据源：目录 + 解析器 + 工具名
+const SOURCES = [
+  {
+    tool: "claude-code",
+    dir: path.join(os.homedir(), ".claude", "projects"),
+    parse: parseClaudeTranscript,
+  },
+  {
+    tool: "codex",
+    dir: path.join(os.homedir(), ".codex", "sessions"),
+    parse: parseCodexRollout,
+  },
+];
+
+// 真实路径比较：HOME 或中间目录可能是符号链接（如 macOS 的 /var -> /private/var），
+// Node 加载主模块默认 realpath，而 os.homedir() 照抄 $HOME——直接比字符串会漏判。
+function realPath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+// 若本脚本从插件目录运行（Claude 钩子），把 agent 同步到稳定副本 ~/.vantage/agent，
+// 供 Codex 定时任务引用——这样插件更新后 Codex 那份也是最新的。
+function syncStableCopy() {
+  const dst = path.join(os.homedir(), ".vantage", "agent");
+  if (realPath(__dirname) === realPath(dst)) return; // 本就是稳定副本，无需同步
+  const lock = updater.acquireUpdateLock(os.homedir());
+  if (!lock) return; // 后台更新器正在替换稳定副本，本次会话不争抢。
+  try {
+    const result = updater.activateAgentTree(__dirname, dst);
+    if (result.changed) core.log(`self-update: stable agent synced digest=${result.digest}`);
+  } catch (e) {
+    core.log(`self-update: stable sync failed ${String(e.message || e)}`);
+  } finally {
+    updater.releaseUpdateLock(lock);
+  }
+}
+
+// 插件路径每 2h 检查；稳定计划任务每 24h 兜底。这里只静默派生稳定更新器，
+// 不等待网络、下载或同步完成，因此不会拖慢 Claude 启动和正常采集。
+function selfUpdate(args) {
+  if (process.env.VANTAGE_DISABLE_SELF_UPDATE) return; // 测试/运维逃生开关
+  const stableCopy = path.join(os.homedir(), ".vantage", "agent");
+  try {
+    const source = realPath(__dirname) === realPath(stableCopy) ? "stable" : "plugin";
+    const state = core.readState();
+    const last = Number(state.__last_self_update__ || 0);
+    const due = updater.shouldCheckForUpdate({
+      source,
+      trigger: args.trigger,
+      elapsedMs: Date.now() - last,
+      pluginIntervalMs: SELF_UPDATE_INTERVAL_MS,
+      scheduledIntervalMs: SELF_UPDATE_SCHEDULED_INTERVAL_MS,
+    });
+    if (!due) return;
+    state.__last_self_update__ = Date.now();
+    core.writeState(state);
+    // 优先派生稳定副本的更新器(插件卸载后仍能自更新)；稳定副本缺更新器
+    // (落后到自更新功能之前)时回退到缓存里的，否则自愈会陷入死循环。
+    const worker = updater.resolveUpdaterWorker({ stableDir: stableCopy });
+    if (!worker) {
+      core.log(`self-update: no updater available source=${source}`);
+      return;
+    }
+    if (!core.spawnNodeHidden(worker, ["--check"])) {
+      core.log(`self-update: spawn failed source=${source}`);
+      return;
+    }
+    core.log(`self-update: check spawned source=${source}`);
+  } catch (e) {
+    core.log(`self-update: trigger failed ${String(e.message || e)}`);
+  }
+}
+
+// 手写递归列目录：readdirSync 的 recursive 选项要 Node 18.17+，老 Node 会静默忽略、
+// 只返回顶层 -> 子目录里的会话（Claude projects/<项目>/、Codex sessions/年/月/日/）
+// 一条都扫不到还不报错。withFileTypes 自 Node 10 可用，不踩版本坑。
+function listJsonl(dir) {
+  const out = [];
+  const stack = [dir];
+  while (stack.length) {
+    const d = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) stack.push(full);
+      else if (e.name.endsWith(".jsonl")) out.push(full);
+    }
+  }
+  return out;
+}
+
+// 清理死信目录 + spool 里的 .bad，超过保留期就删
+function cleanupOld() {
+  const cutoff = Date.now() - RETENTION_DAYS * 86400 * 1000;
+  const dirs = [
+    { dir: core.DEAD_DIR, match: () => true },
+    { dir: core.SPOOL_DIR, match: (f) => f.endsWith(".bad") },
+  ];
+  for (const { dir, match } of dirs) {
+    let files = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!match(f)) continue;
+      const full = path.join(dir, f);
+      try {
+        if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function parseArgs(argv) {
+  const out = { only: null, trigger: "scheduled" };
+  const onlyIdx = argv.indexOf("--only");
+  if (onlyIdx >= 0 && argv[onlyIdx + 1]) out.only = argv[onlyIdx + 1];
+  const triggerIdx = argv.indexOf("--trigger");
+  if (triggerIdx >= 0 && argv[triggerIdx + 1]) out.trigger = argv[triggerIdx + 1];
+  return out;
+}
+
+async function main() {
+  core.ensureDirs();
+  const cfg = core.loadConfig();
+
+  const args = parseArgs(process.argv);
+  const sources = args.only ? SOURCES.filter((s) => s.tool === args.only) : SOURCES;
+
+  // 当前刚开的会话：从 SessionStart 的 stdin 拿 session_id，扫描时跳过它
+  let currentSessionId = "";
+  let hookEvent = "";
+  const raw = await core.readStdin(1200);
+  if (raw && raw.trim()) {
+    try {
+      const hook = JSON.parse(raw);
+      currentSessionId = hook.session_id || "";
+      hookEvent = hook.hook_event_name || "";
+    } catch {
+      /* ignore */
+    }
+  }
+
+  syncStableCopy(); // 从插件目录运行时，刷新 Codex 用的稳定副本（节流前做，插件更新及时生效）
+  selfUpdate(args); // 同在节流前：Claude 两小时检查，计划任务每天兜底，后台无窗执行
+  // Windows:Codex 触发器自检自愈——自更新只同步脚本文件,触发器(装没装/机制换没换)
+  // 由这里顺带保证,员工永远不需要为触发器重跑 setup。非 win32 内部直接返回。
+  try {
+    require("./trigger.cjs").ensureCodexTriggers({ log: core.log });
+  } catch (e) {
+    core.log(`codex 触发器自检异常(已忽略):${e.message}`);
+  }
+
+  // 节流：SessionStart 是高频路径，30 分钟内已全量扫过就不再空转。
+  // 仍触发一次 flush——若 spool 里有断网滞留的记录，网络恢复后开会话即补传，不等下轮扫描。
+  if (hookEvent === "SessionStart") {
+    const last = Number(core.readState().__last_reconcile__ || 0);
+    if (Date.now() - last < THROTTLE_MS) {
+      core.log(
+        `reconcile: throttled (last full scan ${Math.round((Date.now() - last) / 60000)}min ago)`
+      );
+      core.spawnDetached("flush.cjs");
+      return;
+    }
+  }
+
+  // Codex-only 路径的独立节流
+  if (args.only === "codex") {
+    const state = core.readState();
+    const throttleMs = args.trigger === "event" ? CODEX_EVENT_THROTTLE_MS : CODEX_SCHEDULED_THROTTLE_MS;
+    const last = Number(state[`__last_codex_${args.trigger}__`] || 0);
+    if (Date.now() - last < throttleMs) {
+      core.log(`reconcile: codex throttled (trigger=${args.trigger}, last ${Math.round((Date.now() - last) / 60000)}min ago)`);
+      core.spawnDetached("flush.cjs");
+      return;
+    }
+  }
+
+  // 身份变更检测：setup 改了 name/email/department 后（含"从未配置 -> 首次配置"），
+  // 把"已采过"的会话标记清空并记入 restamp 集合，强制本轮用新身份重传——服务端按
+  // session_id upsert 覆盖，旧记录自动拿到正确身份。修"先用了再 setup，身份卡死成机器名"。
+  // 只在全量扫描时做：--only 单源扫描（如 launchd RunAtLoad 的 --only codex）若消耗了
+  // 这个标记，另一数据源里卡空身份的会话就永远等不到重传。
+  const restamp = new Set();
+  if (!args.only) {
+    const idKey = JSON.stringify([cfg.name || "", cfg.email || "", cfg.department || ""]);
+    const state = core.readState();
+    const prev = state.__identity__ ?? "";
+    if (prev !== idKey) {
+      for (const k of Object.keys(state)) {
+        if (!k.startsWith("__")) {
+          // "__" 开头是元数据（__identity__/__last_reconcile__），不是会话文件标记
+          delete state[k];
+          restamp.add(k);
+        }
+      }
+      state.__identity__ = idKey;
+      core.writeState(state);
+      core.log(`identity changed -> re-stamp ${restamp.size} prior session(s) with new identity`);
+    }
+  }
+
+  // 扫描下限：取"最近 N 天"和"安装时刻"中更晚的——安装后只采装后的会话，不倒灌历史。
+  // 例外：restamp 集合里的文件（确实被采过、身份错了的）放宽到"最近 N 天"，
+  // 即使 mtime 早于 installed_at 也重传纠偏；从没采过的装前个人历史仍被闸口挡住。
+  const recentCutoff = Date.now() - RECENT_DAYS * 86400 * 1000;
+  const installCutoff = cfg.installed_at ? Date.parse(cfg.installed_at) : 0;
+  const cutoff = Math.max(recentCutoff, Number.isNaN(installCutoff) ? 0 : installCutoff);
+  cleanupOld();
+  // 剪 state 只按回看窗口，不掺 installed_at：装前会话的"已采"标记是纠偏的证据，
+  // 若被 --only 单源扫描按安装闸口剪掉，后续身份变更就无从知道它该重传。
+  core.pruneState(recentCutoff);
+
+  // Codex 账户额度（app-server 主通道 → wham/usage 降级，见 quota.cjs）：
+  // Codex 专用扫描（--only codex）和全量 reconcile（含 codex 源）都拉。
+  // 专用扫描与定时任务同节流（30min/5min）；全量 reconcile 单独 30min 节流，避免每次开会话都查额度。
+  // 结果贴到当轮所有 Codex 记录；失败→null→记录不带 quota，服务端粘性沿用。
+  let codexQuota = null;
+  const needCodexQuota = args.only === "codex" || sources.some((s) => s.tool === "codex");
+  if (needCodexQuota) {
+    const qstate = core.readState();
+    const cachedQuota = qstate.__quota_cache__ || null;
+    const isFullScan = args.only !== "codex";
+    const throttleKey = isFullScan ? "__last_quota_fetch_full__" : `__last_codex_${args.trigger}__`;
+    const throttleMs = isFullScan
+      ? CODEX_SCHEDULED_THROTTLE_MS
+      : args.trigger === "event"
+        ? CODEX_EVENT_THROTTLE_MS
+        : CODEX_SCHEDULED_THROTTLE_MS;
+    const lastQ = Number(qstate[throttleKey] || 0);
+    let fetched = null;
+    if (Date.now() - lastQ >= throttleMs) {
+      qstate[throttleKey] = Date.now();
+      fetched = await fetchCodexQuota();
+      if (fetched) {
+        // 刷新缓存：供后续失败/节流的轮次兜底，保证每条 codex 记录都带 quota。
+        qstate.__quota_cache__ = { value: fetched, at: Date.now() };
+        core.log(`quota: fetched plan=${fetched.plan_type} used=${fetched.rate_limit?.primary_window?.used_percent ?? "-"}%`);
+      } else {
+        core.log("quota: fetch failed, falling back to cached");
+      }
+      core.writeState(qstate);
+    } else {
+      core.log(`quota: throttled, using cached (${isFullScan ? "full" : args.trigger}, last ${Math.round((Date.now() - lastQ) / 60000)}min ago)`);
+    }
+    // 每条 codex 记录都必须带 quota：本轮新鲜值优先，否则沿用保质期内的缓存。
+    codexQuota = pickQuota(fetched, cachedQuota, QUOTA_CACHE_MAX_AGE_MS);
+  }
+
+  let totalFiles = 0;
+  let swept = 0;
+  for (const src of sources) {
+    const files = listJsonl(src.dir);
+    totalFiles += files.length;
+    for (const file of files) {
+      let st;
+      try {
+        st = fs.statSync(file);
+      } catch {
+        continue;
+      }
+      const fileCutoff = restamp.has(file) ? recentCutoff : cutoff;
+      if (st.mtimeMs < fileCutoff) continue; // 太老，跳过
+      if (currentSessionId && file.includes(currentSessionId)) continue; // 跳过当前会话
+      if (!core.hasChanged(file, st.size, st.mtimeMs)) continue; // 没变，已同步过
+
+      const parsed = src.parse(file);
+      if (!parsed || !parsed.session_id) continue;
+      if (currentSessionId && parsed.session_id === currentSessionId) continue;
+
+      const record = {
+        ...parsed,
+        name: cfg.name,
+        email: cfg.email,
+        department: cfg.department,
+        machine: cfg.machine,
+        exit_reason: "reconciled", // 标记：兜底对账补采
+        dedupe_key: `${parsed.tool}:${parsed.session_id}`,
+        observed_at: new Date().toISOString(), // 快照生成时间(服务端据此判断新旧;旧名 collected_at)
+      };
+      // 额度只贴 Codex（wham 是 OpenAI 账户额度；Claude Code 不沾）。
+      if (parsed.tool === "codex" && codexQuota) record.quota = codexQuota;
+      core.writeSpool(record);
+      core.markProcessed(file, st.size, st.mtimeMs);
+      swept += 1;
+    }
+  }
+
+  core.log(
+    `reconcile: found ${totalFiles} files, spooled ${swept} unsynced (skip=${currentSessionId || "none"})`
+  );
+
+  // 只有真正执行了扫描才更新对应触发源的时间戳（节流路径已 return）
+  if (args.only === "codex") {
+    const state = core.readState();
+    state[`__last_codex_${args.trigger}__`] = Date.now();
+    core.writeState(state);
+  }
+
+  // 全量扫描的 __last_reconcile__ 仅在非 --only 时更新（避免单源扫描污染全量扫描的节流）
+  if (!args.only) {
+    const state = core.readState();
+    state.__last_reconcile__ = Date.now();
+    core.writeState(state);
+  }
+  // 无论本轮是否有新增，都触发一次上传：既发新采的，也补之前失败的。
+  // flush.cjs 内部还会顺手补报 /install(若 state.__install_reported__ 未置位)——
+  // flush 是后台 detached 子进程,网络 15s 也不影响员工。reconcile 自身是 SessionStart
+  // 钩子,不能为补报 /install 多阻塞员工 15s。
+  core.spawnDetached("flush.cjs");
+}
+
+main()
+  .catch((e) => core.log("reconcile fatal: " + String(e)))
+  .finally(() => process.exit(0));

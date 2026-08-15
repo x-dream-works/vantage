@@ -1,0 +1,10 @@
+{
+  "name": "vantage",
+  "displayName": "Vantage",
+  "version": "1.6.0",
+  "description": "dgcrane AI 工具用量计量插件：计量 Claude Code / Codex 的额度用量",
+  "author": {
+    "name": "vantage"
+  },
+  "keywords": ["vantage", "devtools"]
+}
