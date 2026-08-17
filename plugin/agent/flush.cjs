@@ -129,10 +129,11 @@ main()
     // 补报 /install(首次或版本变化时——把当前插件版本带给服务端,后台能看到每人用的版本)
     try {
       const state = core.readState();
-      const ver = core.pluginVersion() || cfg.plugin_version || "";
+      // activePluginVersion:插件目录与稳定副本(Codex 定时任务路径)都能取到真实版本
+      const ver = core.activePluginVersion();
       const reported = state.__install_reported__;
       // 首次上报,或已知版本且与上次上报不同(插件升级后刷新服务端的版本记录)。
-      // ver 为空(稳定副本读不到 plugin.json 且 config 无值)时不再重报,避免每轮空报。
+      // ver 为空(插件清单和安装记录都读不到,如已卸载)时不再重报,避免每轮空报。
       if (cfg.name && (reported === undefined || (ver && reported !== ver))) {
         const base = String(cfg.server_url).replace(/\/+$/, "");
         const status = await core.postJsonUrl(`${base}/install`, cfg.token, { name: cfg.name, ...(ver ? { version: ver } : {}) });

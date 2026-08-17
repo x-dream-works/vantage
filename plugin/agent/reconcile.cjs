@@ -35,6 +35,8 @@ const SELF_UPDATE_INTERVAL_MS = Number(process.env.VANTAGE_SELF_UPDATE_INTERVAL_
 // 用户长时间不打开 Claude 时，由现有计划任务每天静默兜底一次。
 const SELF_UPDATE_SCHEDULED_INTERVAL_MS =
   Number(process.env.VANTAGE_SELF_UPDATE_SCHEDULED_INTERVAL_H || 24) * 3600 * 1000;
+// 心跳探测节流:默认 30 分钟一次(SessionStart 是高频路径,开会话不重复打)。
+const HEARTBEAT_INTERVAL_MS = Number(process.env.VANTAGE_HEARTBEAT_INTERVAL_MIN || 30) * 60 * 1000;
 // quota 缓存保质期：拉取失败/节流跳过时沿用上次成功值，超过此龄则丢弃（不给记录贴太旧的额度）。
 const QUOTA_CACHE_MAX_AGE_MS = Number(process.env.VANTAGE_QUOTA_CACHE_MAX_AGE_H || 24) * 3600 * 1000;
 const QUOTA_PUBLISH_HEARTBEAT_MS = Number(process.env.VANTAGE_QUOTA_PUBLISH_HEARTBEAT_H || 6) * 3600 * 1000;
@@ -79,6 +81,64 @@ function syncStableCopy() {
   }
 }
 
+// 触发侧卡死信号落 state(心跳上报给服务端):稳定副本与插件缓存都缺更新器、
+// 或更新器派生失败——这类机器官方通道永远更不动,后台看板直接看到原因。
+function recordStuck(phase, source) {
+  try {
+    const state = core.readState();
+    state.__self_update_last__ = { at: new Date().toISOString(), ok: false, phase, source };
+    core.writeState(state);
+  } catch {
+    /* 忽略:不能因记录失败影响采集主流程 */
+  }
+}
+
+// 点分版本号数值比较("1.10.0" > "1.9.4"):纯字符串比较会把 1.10 判小于 1.9。
+function compareVersions(a, b) {
+  const pa = String(a).split(".").map(Number);
+  const pb = String(b).split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+// 心跳探测:每轮 reconcile 顺带一次轻量 GET /latest,把"当前版本 + 上次自更新结果"
+// 报给服务端(纯观测,不触发任何更新动作)。后台由此区分三类机器:
+// 更新了没上报 / 真没更新(带原因) / 失联(心跳停了)。失败静默按节流重试,未 setup 不发。
+async function heartbeat(cfg) {
+  if (!cfg.name) return;
+  try {
+    const state = core.readState();
+    if (Date.now() - Number(state.__last_heartbeat__ || 0) < HEARTBEAT_INTERVAL_MS) return;
+    state.__last_heartbeat__ = Date.now();
+    core.writeState(state);
+    const ver = core.activePluginVersion();
+    const last = state.__self_update_last__ || null;
+    const r = !last ? "" : last.ok ? "ok" : `fail:${last.phase || "?"}`;
+    const res = await core.getJson(
+      cfg,
+      `/latest?name=${encodeURIComponent(cfg.name)}` +
+        (ver ? `&v=${encodeURIComponent(ver)}` : "") +
+        (r ? `&r=${encodeURIComponent(r)}` : ""),
+      4000
+    );
+    if (!res) {
+      core.log("heartbeat: unreachable (throttled retry)");
+      return;
+    }
+    const server = String(res.version || "");
+    if (server && ver && compareVersions(ver, server) < 0) {
+      core.log(`heartbeat: update available local=${ver} server=${server}`);
+    } else {
+      core.log(`heartbeat: ok local=${ver || "?"} server=${server || "?"}`);
+    }
+  } catch (e) {
+    core.log(`heartbeat: error ${String(e.message || e)}`);
+  }
+}
+
 // 插件路径每 2h 检查；稳定计划任务每 24h 兜底。这里只静默派生稳定更新器，
 // 不等待网络、下载或同步完成，因此不会拖慢 Claude 启动和正常采集。
 function selfUpdate(args) {
@@ -103,10 +163,12 @@ function selfUpdate(args) {
     const worker = updater.resolveUpdaterWorker({ stableDir: stableCopy });
     if (!worker) {
       core.log(`self-update: no updater available source=${source}`);
+      recordStuck("no-updater", source);
       return;
     }
     if (!core.spawnNodeHidden(worker, ["--check"])) {
       core.log(`self-update: spawn failed source=${source}`);
+      recordStuck("spawn", source);
       return;
     }
     core.log(`self-update: check spawned source=${source}`);
@@ -203,6 +265,9 @@ async function main() {
   } catch (e) {
     core.log(`codex 触发器自检异常(已忽略):${e.message}`);
   }
+  // 心跳:版本 + 上次自更新结果观测上报。放在各节流 early-return 之前,
+  // 开会话/定时任务都能刷;自带 30min 节流,单次失败静默等下轮。
+  await heartbeat(cfg);
 
   // 节流：SessionStart 是高频路径，30 分钟内已全量扫过就不再空转。
   // 仍触发一次 flush——若 spool 里有断网滞留的记录，网络恢复后开会话即补传，不等下轮扫描。

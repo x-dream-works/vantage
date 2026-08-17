@@ -207,8 +207,8 @@ function writeConfig(department) {
   } catch {
     /* 首次安装 */
   }
-  // 当前插件版本:setup 时固化进 config,稳定副本(Codex 触发器)上报安装时可带出
-  const version = pluginVersion();
+  // 当前插件版本不固化进 config:稳定副本侧统一走 core.activePluginVersion()
+  // (读 Claude 安装记录),config 里的 plugin_version 从来透不出来(loadConfig 白名单)。
   fs.writeFileSync(
     p,
     JSON.stringify(
@@ -218,7 +218,6 @@ function writeConfig(department) {
         server_url: serverUrl,
         token,
         installed_at: installedAt,
-        ...(version ? { plugin_version: version } : {}),
       },
       null,
       2,

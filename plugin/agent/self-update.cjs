@@ -377,6 +377,31 @@ function runOfficialUpdate(options = {}) {
   return { ok: true, phase: "complete", status: 0, outputTail: "", steps: evidence };
 }
 
+/** 把自更新结果写进 state(不走 core:其路径在模块加载时固化,测试沙箱注入的
+ *  home 会被无视、写到真实用户目录;这里按注入 home 直写,生产环境两者同一路径)。
+ *  心跳(reconcile)读取 __self_update_last__ 上报服务端,后台由此看到"谁没更、为什么"。 */
+function recordSelfUpdateState(home, obj) {
+  try {
+    const statePath = path.join(home, ".vantage", "state.json");
+    let state = {};
+    try {
+      state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    } catch {}
+    state.__self_update_last__ = { at: new Date().toISOString(), ...obj };
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    const tmp = `${statePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, statePath);
+  } catch {
+    /* 结果记录失败不影响更新流程本身 */
+  }
+}
+
+function shortDetail(text, max = 80) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 /** 完整闭环：官方更新成功后，激活生效缓存并使用新代码修复触发器。 */
 function runUpdateAndActivate(options = {}) {
   const home = options.home || os.homedir();
@@ -411,6 +436,11 @@ function runUpdateAndActivate(options = {}) {
         `self-update: ${updated.phase} failed status=${updated.status} timeout=${updated.timedOut ? 1 : 0}` +
           (updated.outputTail ? ` output=${updated.outputTail}` : "")
       );
+      recordSelfUpdateState(home, {
+        ok: false,
+        phase: updated.phase,
+        detail: shortDetail(`status=${updated.status ?? "?"} ${updated.outputTail || ""}`),
+      });
       return updated;
     }
     const activated = activate({
@@ -422,9 +452,11 @@ function runUpdateAndActivate(options = {}) {
     writeLog(
       `self-update: complete version=${activated.version} changed=${activated.changed ? 1 : 0} digest=${activated.digest}`
     );
+    recordSelfUpdateState(home, { ok: true, phase: "complete", version: activated.version });
     return { ok: true, phase: "complete", ...activated };
   } catch (e) {
     writeLog(`self-update: activate failed ${String(e.message || e)}`);
+    recordSelfUpdateState(home, { ok: false, phase: "activate", detail: shortDetail(e.message || e) });
     return { ok: false, phase: "activate", error: String(e.message || e) };
   } finally {
     releaseUpdateLock(lock);

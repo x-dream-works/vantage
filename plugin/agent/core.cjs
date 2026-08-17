@@ -389,6 +389,30 @@ function pluginVersion() {
   }
 }
 
+/** 当前生效的插件版本(与运行位置无关)。
+ *  优先本插件清单(从插件目录跑);稳定副本读不到时,查 Claude 的用户级安装记录
+ *  installed_plugins.json——那里由 claude CLI 维护,plugin update 完成即刷新,
+ *  是权威版本。修"纯 Codex 机器(Codex 定时任务只从稳定副本跑)永远报不出
+ *  当前版本"的盲区。任何一步失败返回空串,调用方按"未知版本"处理。 */
+function activePluginVersion(home = os.homedir()) {
+  const own = pluginVersion();
+  if (own) return own;
+  try {
+    const installed = JSON.parse(
+      fs.readFileSync(path.join(home, ".claude", "plugins", "installed_plugins.json"), "utf8")
+    );
+    const records = Array.isArray(installed?.plugins?.["vantage@dgcrane"])
+      ? installed.plugins["vantage@dgcrane"].filter((r) => r && r.scope === "user")
+      : [];
+    records.sort(
+      (a, b) => Date.parse(b.lastUpdated || 0) - Date.parse(a.lastUpdated || 0)
+    );
+    return String(records[0]?.version || "");
+  } catch {
+    return "";
+  }
+}
+
 module.exports = {
   BASE_DIR,
   CONFIG_PATH,
@@ -400,6 +424,7 @@ module.exports = {
   writeFileAtomic,
   loadConfig,
   pluginVersion,
+  activePluginVersion,
   log,
   readState,
   writeState,

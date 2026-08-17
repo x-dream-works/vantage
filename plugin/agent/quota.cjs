@@ -299,10 +299,14 @@ function mapAppServerQuota(result) {
 function mapWhamQuota(result) {
   const rl = result && result.rate_limit;
   if (!rl) return null;
+  // 达限标记在 rate_limit 容器层(窗口对象里没有)——实测 2026-08 的响应:
+  // rate_limit: { allowed, limit_reached, primary_window, secondary_window }
+  // 顶层另有 rate_limit_reached_type,达限时非空。两者任一为真都算 limit_reached。
+  const reached = !!(rl.limit_reached || result.rate_limit_reached_type);
   return canonicalQuota(
     result.plan_type,
-    quotaWindow(rl.primary_window, false),
-    quotaWindow(rl.secondary_window, false),
+    quotaWindow(rl.primary_window, reached),
+    quotaWindow(rl.secondary_window, reached),
     "wham"
   );
 }
